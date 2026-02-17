@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -457,4 +458,82 @@ func UpgradeHelmChart(_ context.Context, clusterProxy framework.ClusterProxy, na
 		Logf("Helm upgrade output: %s", string(output))
 		return err
 	}, helmInstallTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
+}
+
+// SetHelmReleaseStatus overwrites the status of the latest Helm release secret in the workload cluster.
+// This is used by e2e tests to simulate a stuck release in pending-install (overwrite latest release status).
+func SetHelmReleaseStatus(ctx context.Context, workloadClusterProxy framework.ClusterProxy, releaseNamespace, releaseName string, status helmRelease.Status) {
+	secretInterface := workloadClusterProxy.GetClientSet().CoreV1().Secrets(releaseNamespace)
+	driver := helmDriver.NewSecrets(secretInterface)
+	driver.Log = Logf
+
+	releases, err := driver.Query(map[string]string{"name": releaseName})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(releases).NotTo(BeEmpty(), "no release found for name %s in namespace %s", releaseName, releaseNamespace)
+
+	var current *helmRelease.Release
+	for _, r := range releases {
+		if current == nil || r.Version > current.Version {
+			current = r
+		}
+	}
+	Expect(current).NotTo(BeNil())
+
+	key := fmt.Sprintf("sh.helm.release.v1.%s.v%s", releaseName, strconv.Itoa(current.Version))
+	rel, err := driver.Get(key)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(rel).NotTo(BeNil())
+
+	rel.Info.Status = status
+	Expect(driver.Update(key, rel)).To(Succeed())
+	Logf("Set Helm release %s/%s status to %s", releaseNamespace, releaseName, status)
+}
+
+// CreateHelmReleaseWithStatusFromLatest creates a new Helm release record (new secret) with the given status,
+// copying all other data from the latest release. The new record has version = latest.Version+1, so Helm's
+// Get will return this release (in the simulated stuck state). Used to simulate pending-upgrade,
+// pending-rollback, and uninstalling without overwriting the existing latest release.
+func CreateHelmReleaseWithStatusFromLatest(ctx context.Context, workloadClusterProxy framework.ClusterProxy, releaseNamespace, releaseName string, status helmRelease.Status) {
+	secretInterface := workloadClusterProxy.GetClientSet().CoreV1().Secrets(releaseNamespace)
+	driver := helmDriver.NewSecrets(secretInterface)
+	driver.Log = Logf
+
+	releases, err := driver.Query(map[string]string{"name": releaseName})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(releases).NotTo(BeEmpty(), "no release found for name %s in namespace %s", releaseName, releaseNamespace)
+
+	var latest *helmRelease.Release
+	for _, r := range releases {
+		if latest == nil || r.Version > latest.Version {
+			latest = r
+		}
+	}
+	Expect(latest).NotTo(BeNil())
+
+	newVersion := latest.Version + 1
+	newRel := &helmRelease.Release{
+		Name:      latest.Name,
+		Namespace: latest.Namespace,
+		Chart:     latest.Chart,
+		Config:    latest.Config,
+		Manifest:  latest.Manifest,
+		Hooks:     latest.Hooks,
+		Version:   newVersion,
+		Labels:    latest.Labels,
+	}
+	if latest.Info != nil {
+		newRel.Info = &helmRelease.Info{
+			Status:        status,
+			FirstDeployed: latest.Info.FirstDeployed,
+			LastDeployed:  latest.Info.LastDeployed,
+			Deleted:       latest.Info.Deleted,
+			Description:   latest.Info.Description,
+		}
+	} else {
+		newRel.Info = &helmRelease.Info{Status: status}
+	}
+
+	key := fmt.Sprintf("sh.helm.release.v1.%s.v%s", releaseName, strconv.Itoa(newVersion))
+	Expect(driver.Create(key, newRel)).To(Succeed())
+	Logf("Created new Helm release %s/%s v%d with status %s (copy of latest)", releaseNamespace, releaseName, newVersion, status)
 }
