@@ -28,6 +28,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	helmRelease "helm.sh/helm/v3/pkg/release"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -423,6 +424,74 @@ var _ = Describe("Workload cluster creation", func() {
 				}
 				EnsureHelmReleaseInstallOrUpgrade(ctx, specName, bootstrapClusterProxy, installInput, nil, false)
 			})
+		})
+	})
+
+	Context("Creating workload cluster [REQUIRED]", func() {
+		It("With default template to finish install when Helm release is in pending-install status", func() {
+			clusterName = fmt.Sprintf("%s-%s", specName, util.RandomString(6))
+			clusterctl.ApplyClusterTemplateAndWait(ctx, createApplyClusterTemplateInput(
+				specName,
+				withNamespace(namespace.Name),
+				withClusterName(clusterName),
+				withControlPlaneMachineCount(1),
+				withWorkerMachineCount(1),
+				withControlPlaneWaiters(clusterctl.ControlPlaneWaiters{
+					WaitForControlPlaneInitialized: EnsureControlPlaneInitialized,
+				}),
+			), result)
+
+			releaseName := "metallb-name"
+			releaseNamespace := "metallb-namespace"
+			metallbRepoURL := "https://metallb.github.io/metallb"
+			metallbChartName := "metallb"
+			metallbVersion := "0.15.2"
+
+			By("Creating fake Helm release with pending-install status for metallb chart")
+			workloadClusterProxy := bootstrapClusterProxy.GetWorkloadCluster(ctx, namespace.Name, clusterName)
+			Expect(workloadClusterProxy).NotTo(BeNil())
+			// UpgradeHelmChart will install the chart, because no release exists yet.
+			UpgradeHelmChart(ctx, workloadClusterProxy, releaseNamespace, metallbRepoURL, metallbChartName, releaseName, &HelmOptions{}, metallbVersion)
+			SetHelmReleaseStatus(ctx, workloadClusterProxy, releaseNamespace, releaseName, helmRelease.StatusPendingInstall)
+
+			By("Creating HelmChartProxy for metallb chart")
+			hcp := &addonsv1alpha1.HelmChartProxy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "metallb",
+					Namespace: namespace.Name,
+				},
+				Spec: addonsv1alpha1.HelmChartProxySpec{
+					ClusterSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"MetalLBChart": "enabled",
+						},
+					},
+					ReleaseName:       releaseName,
+					ReleaseNamespace:  releaseNamespace,
+					ChartName:         metallbChartName,
+					RepoURL:           metallbRepoURL,
+					Version:           metallbVersion,
+					ValuesTemplate:    metallbValues,
+					ReconcileStrategy: string(addonsv1alpha1.ReconcileStrategyContinuous),
+				},
+			}
+			Expect(bootstrapClusterProxy.GetClient().Create(ctx, hcp)).To(Succeed())
+
+			By("Waiting for controller to create HelmReleaseProxy, reset release status to failed, and successfully upgrade the chart")
+			EnsureHelmReleaseInstallOrUpgrade(
+				ctx,
+				specName,
+				bootstrapClusterProxy,
+				nil, // installInput
+				&HelmUpgradeInput{
+					BootstrapClusterProxy: bootstrapClusterProxy,
+					Namespace:             namespace,
+					ClusterName:           clusterName,
+					HelmChartProxy:        hcp,
+					ExpectedRevision:      2, // expected revision is 2 because the controller will upgrade the chart to the latest version
+				},
+				true,
+			)
 		})
 	})
 })
