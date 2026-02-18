@@ -569,6 +569,81 @@ var _ = Describe("Workload cluster creation", func() {
 	})
 
 	Context("Creating workload cluster [REQUIRED]", func() {
+		It("With default template to finish upgrade when Helm release is in pending-rollback status", func() {
+			// A release can be in pending-rollback status is if it was upgraded with the Atomic option enabled,
+			// the upgrade failed, and the rollback also failed.
+			clusterName = fmt.Sprintf("%s-%s", specName, util.RandomString(6))
+			clusterctl.ApplyClusterTemplateAndWait(ctx, createApplyClusterTemplateInput(
+				specName,
+				withNamespace(namespace.Name),
+				withClusterName(clusterName),
+				withControlPlaneMachineCount(1),
+				withWorkerMachineCount(1),
+				withControlPlaneWaiters(clusterctl.ControlPlaneWaiters{
+					WaitForControlPlaneInitialized: EnsureControlPlaneInitialized,
+				}),
+			), result)
+
+			hcp := &addonsv1alpha1.HelmChartProxy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "metallb",
+					Namespace: namespace.Name,
+				},
+				Spec: addonsv1alpha1.HelmChartProxySpec{
+					ClusterSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"MetalLBChart": "enabled",
+						},
+					},
+					ReleaseName:       "metallb-name",
+					ReleaseNamespace:  "metallb-namespace",
+					ChartName:         "metallb",
+					RepoURL:           "https://metallb.github.io/metallb",
+					Version:           "0.15.2",
+					ValuesTemplate:    metallbValues,
+					ReconcileStrategy: string(addonsv1alpha1.ReconcileStrategyContinuous),
+				},
+			}
+
+			// Create new Helm chart
+			By("Creating new HelmChartProxy to install metallb", func() {
+				HelmInstallSpec(ctx, func() HelmInstallInput {
+					return HelmInstallInput{
+						BootstrapClusterProxy: bootstrapClusterProxy,
+						Namespace:             namespace,
+						ClusterName:           clusterName,
+						HelmChartProxy:        hcp,
+					}
+				})
+			})
+
+			By("Overwriting the last Helm release status to pending-rollback")
+			hrp, err := getHelmReleaseProxy(ctx, bootstrapClusterProxy.GetClient(), clusterName, *hcp)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hrp).NotTo(BeNil())
+			workloadClusterProxy := bootstrapClusterProxy.GetWorkloadCluster(ctx, namespace.Name, clusterName)
+			Expect(workloadClusterProxy).NotTo(BeNil())
+			SetHelmReleaseStatus(ctx, workloadClusterProxy, hrp.Spec.ReleaseNamespace, hrp.Spec.ReleaseName, helmRelease.StatusPendingRollback)
+
+			By("Waiting for controller to create HelmReleaseProxy, reset release status to failed, and successfully upgrade the chart")
+			EnsureHelmReleaseInstallOrUpgrade(
+				ctx,
+				specName,
+				bootstrapClusterProxy,
+				nil, // installInput
+				&HelmUpgradeInput{
+					BootstrapClusterProxy: bootstrapClusterProxy,
+					Namespace:             namespace,
+					ClusterName:           clusterName,
+					HelmChartProxy:        hcp,
+					ExpectedRevision:      2, // expected revision is 2 because the controller will upgrade the chart to the latest version
+				},
+				true,
+			)
+		})
+	})
+
+	Context("Creating workload cluster [REQUIRED]", func() {
 		It("With default template to finish uninstall when Helm release is in uninstalling status", func() {
 			clusterName = fmt.Sprintf("%s-%s", specName, util.RandomString(6))
 			clusterctl.ApplyClusterTemplateAndWait(ctx, createApplyClusterTemplateInput(
